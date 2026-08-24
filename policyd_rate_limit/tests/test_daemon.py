@@ -9,7 +9,9 @@
 #
 # (c) 2016 Valentin Samir
 import os
+import sqlite3
 import tempfile
+import time
 from unittest import TestCase
 
 from policyd_rate_limit.tests import utils as test_utils
@@ -256,6 +258,87 @@ class DaemonTestCase(TestCase):
         self.base_config["smtp_server"] = "localhost"
         with test_utils.lauch(self.base_config, options=["--clean"], get_process=True) as p:
             self.assertEqual(p.wait(timeout=10), 8)
+
+    def limit_report(self):
+        """Return the rows of the limit_report table of the test database"""
+        db = sqlite3.connect(self.base_config["sqlite_config"]["database"])
+        try:
+            cur = db.cursor()
+            cur.execute("SELECT id, delta, hit, date FROM limit_report")
+            return sorted(cur.fetchall())
+        finally:
+            db.close()
+
+    def test_report_hits_by_day(self):
+        with test_utils.lauch(self.base_config) as cfg:
+            # the first 10 requests pass, the 2 next hit the 10 mails by minute limit
+            for i in range(12):
+                test_utils.send_policyd_request(cfg["SOCKET"], sasl_username="test")
+        # both hits of the day are aggregated on a single row dated of today
+        self.assertEqual(
+            self.limit_report(),
+            [("test", 60, 2, time.strftime("%Y-%m-%d"))]
+        )
+
+    def test_report_add_date_migration(self):
+        # build a limit_report table as created by a version without the date column
+        db = sqlite3.connect(self.base_config["sqlite_config"]["database"])
+        try:
+            cur = db.cursor()
+            cur.execute(
+                "CREATE TABLE limit_report ("
+                "id varchar(40) NOT NULL, delta int NOT NULL, hit int NOT NULL DEFAULT 0)"
+            )
+            cur.execute("CREATE UNIQUE INDEX limit_report_index ON limit_report(id, delta)")
+            cur.execute("INSERT INTO limit_report (id, delta, hit) VALUES ('old', 60, 5)")
+            db.commit()
+        finally:
+            db.close()
+        with test_utils.lauch(self.base_config) as cfg:
+            for i in range(12):
+                test_utils.send_policyd_request(cfg["SOCKET"], sasl_username="test")
+        # the already recorded hits are kept and dated of today, new hits are recorded as usual
+        today = time.strftime("%Y-%m-%d")
+        self.assertEqual(
+            self.limit_report(),
+            [("old", 60, 5, today), ("test", 60, 2, today)]
+        )
+
+    def test_clean_retention_days(self):
+        self.base_config["retention_days"] = 2
+        # a first run to let the daemon create the tables and record a mail of today
+        with test_utils.lauch(self.base_config) as cfg:
+            test_utils.send_policyd_request(cfg["SOCKET"], sasl_username="test")
+        old_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 3 * 86400))
+        db = sqlite3.connect(self.base_config["sqlite_config"]["database"])
+        try:
+            cur = db.cursor()
+            cur.execute(
+                "INSERT INTO mail_count VALUES ('old', ?, 1, 'instance', 'RCPT')",
+                (int(time.time() - 3 * 86400),)
+            )
+            cur.execute(
+                "INSERT INTO limit_report (id, delta, hit, date) VALUES (?, 60, 5, ?)",
+                ("old", old_day)
+            )
+            cur.execute(
+                "INSERT INTO limit_report (id, delta, hit, date) VALUES (?, 60, 5, ?)",
+                ("recent", time.strftime("%Y-%m-%d"))
+            )
+            db.commit()
+        finally:
+            db.close()
+        with test_utils.lauch(self.base_config, options=["--clean"], get_process=True) as p:
+            self.assertEqual(p.wait(timeout=10), 0)
+        # only the records of the last 2 days are kept, in both tables
+        db = sqlite3.connect(self.base_config["sqlite_config"]["database"])
+        try:
+            cur = db.cursor()
+            cur.execute("SELECT id FROM mail_count")
+            self.assertEqual(cur.fetchall(), [("test",)])
+        finally:
+            db.close()
+        self.assertEqual([row[0] for row in self.limit_report()], ["recent"])
 
     def test_limits_by_id(self):
         self.base_config["limits_by_id"] = {'foo': [[2, 60]], 'bar': []}

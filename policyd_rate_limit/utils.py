@@ -321,6 +321,20 @@ def is_ip_limited(ip):
     return False
 
 
+def today():
+    """Return the current day (local time) as a ``YYYY-MM-DD`` string"""
+    return time.strftime("%Y-%m-%d")
+
+
+def format_date(date):
+    """Format a date returned by a database backend as a ``YYYY-MM-DD`` string"""
+    try:
+        return date.strftime("%Y-%m-%d")
+    except AttributeError:
+        # the sqlite3 backend returns dates as plain strings
+        return "%s" % date
+
+
 def print_fw(msg, length, filler=' ', align_left=True):
     msg = "%s" % msg
     if len(msg) > length:
@@ -331,23 +345,33 @@ def print_fw(msg, length, filler=' ', align_left=True):
         return "%s%s" % (filler * (length - len(msg)), msg)
 
 
+def retention_start():
+    """
+        Return the couple (timestamp, day) of the 00:00 of the first day to keep,
+        i.e. ``config.retention_days`` days ago.
+    """
+    day = time.localtime(time.time() - config.retention_days * 86400)
+    midnight = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 0, 0, 0, 0, 0, -1))
+    return (int(midnight), time.strftime("%Y-%m-%d", day))
+
+
 def clean():
     """Delete old records from the database"""
-    max_delta = 0
-    for nb, delta in config.limits:
-        max_delta = max(max_delta, delta)
-    # remove old record older than 2*max_delta
-    expired = int(time.time() - max_delta - max_delta)
+    # both tables keep config.retention_days days of history
+    (expired, expired_date) = retention_start()
     report_text = ""
     with cursor() as cur:
-        cur.execute("DELETE FROM mail_count WHERE date <= %s" % config.format_str, (expired,))
+        cur.execute("DELETE FROM mail_count WHERE date < %s" % config.format_str, (expired,))
         print("%d records deleted" % cur.rowcount)
-        # if report is True, generate a mail report
-        if config.report and config.report_to:
-            report_text = gen_report(cur)
         if config.report:
-            # The mail report has been successfully send, flush limit_report
-            cur.execute("DELETE FROM limit_report")
+            # limit_report keeps one row per (id, delta, day), only drop the older days
+            cur.execute(
+                "DELETE FROM limit_report WHERE date < %s" % config.format_str,
+                (expired_date,)
+            )
+            # if report_to is set, generate a mail report
+            if config.report_to:
+                report_text = gen_report(cur)
     # send report
     if len(report_text) != 0:
         send_report(report_text)
@@ -372,54 +396,65 @@ def clean():
 
 
 def gen_report(cur):
-    cur.execute("SELECT id, delta, hit FROM limit_report")
+    cur.execute("SELECT id, delta, hit, date FROM limit_report")
     # list to sort ids by hits
     report = list(cur.fetchall())
     text = []
+    period = "the last %d days" % config.retention_days
     if not config.report_only_if_needed or report:
         if report:
-            text = ["Below is the table of users who hit a limit since the last cleanup:", ""]
-            # dist to groups deltas by ids
+            text = ["Below is the table of users who hit a limit during %s:" % period, ""]
+            # dist to groups days and deltas by ids
             report_d = collections.defaultdict(list)
-            max_d = {'id': 2, 'delta': 5, 'hit': 3}
-            for (id, delta, hit) in report:
-                report_d[id].append((delta, hit))
+            max_d = {'id': 2, 'delta': 5, 'hit': 3, 'date': 4}
+            for (id, delta, hit, date) in report:
+                date = format_date(date)
+                report_d[id].append((date, delta, hit))
                 max_d['id'] = max(max_d['id'], len(id))
                 max_d['delta'] = max(max_d['delta'], len(str(delta)) + 1)
                 max_d['hit'] = max(max_d['hit'], len(str(hit)))
+                max_d['date'] = max(max_d['date'], len(date))
             # sort by hits
             report.sort(key=lambda x: x[2])
             # table header
             text.append(
-                "|%s|%s|%s|" % (
+                "|%s|%s|%s|%s|" % (
                     print_fw("id", max_d['id']),
                     print_fw("delta", max_d['delta']),
-                    print_fw("hit", max_d['hit'])
+                    print_fw("hit", max_d['hit']),
+                    print_fw("date", max_d['date'])
                 )
             )
             # table header/data separation
             text.append(
-                "|%s+%s+%s|" % (
+                "|%s+%s+%s+%s|" % (
                     print_fw("", max_d['id'], filler='-'),
                     print_fw("", max_d['delta'], filler='-'),
-                    print_fw("", max_d['hit'], filler='-')
+                    print_fw("", max_d['hit'], filler='-'),
+                    print_fw("", max_d['date'], filler='-')
                 )
             )
 
-            for (id, _, _) in report:
-                # sort by delta
+            printed = set()
+            for (id, _, _, _) in report:
+                # an id now has one row per day, only print its rows once
+                if id in printed:
+                    continue
+                printed.add(id)
+                # sort by day, then by delta
                 report_d[id].sort()
-                for (delta, hit) in report_d[id]:
+                for (date, delta, hit) in report_d[id]:
                     # add a table row
                     text.append(
-                        "|%s|%s|%s|" % (
+                        "|%s|%s|%s|%s|" % (
                             print_fw(id, max_d['id'], align_left=False),
                             print_fw("%ss" % delta, max_d['delta'], align_left=False),
-                            print_fw(hit, max_d['hit'], align_left=False)
+                            print_fw(hit, max_d['hit'], align_left=False),
+                            print_fw(date, max_d['date'], align_left=False)
                         )
                     )
         else:
-            text = ["No user hit a limit since the last cleanup"]
+            text = ["No user hit a limit during %s" % period]
         text.extend(["", "-- ", "policyd-rate-limit"])
     return text
 
@@ -467,6 +502,81 @@ def send_report(text):
         server.quit()
 
 
+def limit_report_add_date(cur):
+    """
+        Migrate a limit_report table created by an older version: add the date column,
+        date the already recorded hits of the current day and drop the (id, delta) unique
+        index, it is recreated on (id, delta, date) by :func:`database_init`.
+    """
+    try:
+        cur.execute("SELECT date FROM limit_report")
+        cur.fetchall()
+    except cursor.backend_module.Error as error:
+        # The table limit_report exists but has no date column, add it.
+        if (
+                (cursor.backend == MYSQL_DB and error.args[0] == 1054) or
+                (
+                        cursor.backend == SQLITE_DB and
+                        error.args[0] == 'no such column: date'
+                ) or
+                (
+                        cursor.backend == PGSQL_DB and
+                        isinstance(error, cursor.backend_module.errors.UndefinedColumn)
+                )
+        ):
+            cursor.get_db().commit()
+            cur.execute("ALTER TABLE limit_report ADD COLUMN date date")
+            cur.execute(
+                "UPDATE limit_report SET date = %s WHERE date IS NULL" % config.format_str,
+                (today(),)
+            )
+            # now that every row is dated, forbid null dates as on a freshly created table.
+            # sqlite is left out, it is unable to alter a column.
+            if cursor.backend == MYSQL_DB:
+                cur.execute("ALTER TABLE limit_report MODIFY date date NOT NULL")
+                cur.execute("DROP INDEX limit_report_index ON limit_report")
+            else:
+                if cursor.backend == PGSQL_DB:
+                    cur.execute("ALTER TABLE limit_report ALTER COLUMN date SET NOT NULL")
+                cur.execute("DROP INDEX IF EXISTS limit_report_index")
+        # The table limit_report does not exist, it will be created with the date column
+        elif cursor.backend == MYSQL_DB and error.args[0] == 1146:
+            cursor.get_db().commit()
+        elif cursor.backend == SQLITE_DB and error.args[0] == 'no such table: limit_report':
+            cursor.get_db().commit()
+        elif (
+                cursor.backend == PGSQL_DB and
+                isinstance(error, cursor.backend_module.errors.UndefinedTable)
+        ):
+            cursor.get_db().commit()
+        else:
+            raise
+
+
+def limit_report_widen_id(cur):
+    """
+        Migrate a limit_report table created by an older version: the id column was a
+        varchar(40), too short to hold many email addresses.
+    """
+    # sqlite does not enforce the length of varchar columns
+    if cursor.backend == SQLITE_DB:
+        return
+    cur.execute(
+        "SELECT character_maximum_length FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'limit_report' AND column_name = 'id'" % (
+            "DATABASE()" if cursor.backend == MYSQL_DB else "current_schema()"
+        )
+    )
+    length = cur.fetchone()
+    # the table does not exist yet, it will be created with the right length
+    if length is None or length[0] is None or length[0] >= 255:
+        return
+    if cursor.backend == MYSQL_DB:
+        cur.execute("ALTER TABLE limit_report MODIFY id varchar(255) NOT NULL")
+    else:
+        cur.execute("ALTER TABLE limit_report ALTER COLUMN id TYPE varchar(255)")
+
+
 def database_init():
     """Initialize database (create the table and index)"""
     with cursor() as cur:
@@ -490,11 +600,13 @@ def database_init():
               PRIMARY KEY (id)
             );"""
 
-        # if report is enable, also create the table for storing report datas
+        # if report is enable, also create the table for storing report datas.
+        # hits are counted by day, so there is one row per (id, delta, date).
         query_report = """CREATE TABLE IF NOT EXISTS limit_report (
-      id varchar(40) NOT NULL,
+      id varchar(255) NOT NULL,
       delta int NOT NULL,
-      hit int NOT NULL DEFAULT 0
+      hit int NOT NULL DEFAULT 0,
+      date date NOT NULL
     );"""
         # Test the table version
         try:
@@ -529,6 +641,10 @@ def database_init():
                 cursor.get_db().commit()
             else:
                 raise
+        # Test the limit_report table version
+        if config.report:
+            limit_report_add_date(cur)
+            limit_report_widen_id(cur)
         # Create the table if needed
         try:
             if cursor.backend == MYSQL_DB:
@@ -550,11 +666,11 @@ def database_init():
             # Duplicate key name for the mysql backend
             if error.args[0] not in [1061]:
                 raise
-        # if report is enable, create and unique index on (id, delta)
+        # if report is enable, create and unique index on (id, delta, date)
         if config.report:
             try:
                 cur.execute(
-                    'CREATE UNIQUE INDEX %s limit_report_index ON limit_report(id, delta)' % (
+                    'CREATE UNIQUE INDEX %s limit_report_index ON limit_report(id, delta, date)' % (
                           "" if cursor.backend == 1 else "IF NOT EXISTS"
                     )
                 )
@@ -566,19 +682,21 @@ def database_init():
 
 
 def hit(cur, delta, id):
-    # if no row is updated, (id, delta) do not exists and insert
+    # hits are counted by day (from 00:00 to 23:59, local time)
+    date = today()
+    # if no row is updated, (id, delta, date) do not exists and insert
     cur.execute(
-        "UPDATE limit_report SET hit=hit+1 WHERE id = %s and delta = %s" % (
-            (config.format_str,)*2
+        "UPDATE limit_report SET hit=hit+1 WHERE id = %s and delta = %s and date = %s" % (
+            (config.format_str,)*3
         ),
-        (id, delta)
+        (id, delta, date)
     )
     if cur.rowcount <= 0:
         cur.execute(
-            "INSERT INTO limit_report (id, delta, hit) VALUES (%s, %s, 1)" % (
-                (config.format_str,)*2
+            "INSERT INTO limit_report (id, delta, hit, date) VALUES (%s, %s, 1, %s)" % (
+                (config.format_str,)*3
             ),
-            (id, delta)
+            (id, delta, date)
         )
 
 

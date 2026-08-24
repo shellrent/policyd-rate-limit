@@ -116,6 +116,10 @@ The ``.yaml`` are the new configuration format using the YAML syntax.
 * ``config_file``: This parameter is automatically set to the path of the configuration file
   currently in use. You can call it conjunction with **--get-config** to known which configuration
   file is used.
+* ``retention_days``: Number of days of history kept in the ``mail_count`` and ``limit_report``
+  tables. Days are counted from 00:00 to 23:59 (local time) and the older records are deleted
+  each time --clean is called. It must be greater than the longest period of the ``limits``
+  list, else the counters used to apply the limits are truncated. The default is ``30``.
 
 
 * ``report``: if ``True``, send a report to ``report_to`` about users reaching limits each time

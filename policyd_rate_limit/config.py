@@ -64,6 +64,11 @@ fail_action = "defer_if_permit Rate limit reach, retry later"
 # action to return to postfix when we are unable to contect the database backend
 db_error_action = "dunno"
 
+# number of days of history kept in the mail_count and limit_report tables. Older records
+# are deleted each time --clean is called. It must be greater than the longest period of
+# the limits list, else the counters used to apply the limits are truncated.
+retention_days = 30
+
 
 # if True, send a report to report_email about users reaching limits each time --clean is called
 report = False

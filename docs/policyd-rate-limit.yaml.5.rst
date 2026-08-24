@@ -91,6 +91,11 @@ Settings
   If we are unable to to contect the database backend, which action postfix should do.
   The default is "dunno".
   See **access**)(5) for possible actions.
+**retention_days**
+  Number of days of history kept in the **mail_count** and **limit_report** tables. Days are
+  counted from 00:00 to 23:59 (local time) and the older records are deleted each time
+  --clean is called. It must be greater than the longest period of the **limits** list, else
+  the counters used to apply the limits are truncated. The default is 30.
 **config_file**
   This parameter is automatically set to the path of the configuration file currently in use.
   You can call it in conjunction with **--get-config** to known which configuration file is used.

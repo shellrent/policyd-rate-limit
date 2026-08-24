@@ -83,6 +83,12 @@ fail_action: "defer_if_permit Rate limit reach, retry later"
 # see http://www.postfix.org/access.5.html for a list of actions.
 db_error_action: "dunno"
 
+# Number of days of history kept in the mail_count and limit_report tables. Days are counted
+# from 00:00 to 23:59 and the older records are deleted each time --clean is called.
+# It must be greater than the longest period of the limits list, else the counters used to
+# apply the limits are truncated.
+retention_days: 30
+
 # If True, send a report to report_to about users reaching limits each time --clean is called
 report: False
 # from who to send emails reports. Must be defined if report: True
